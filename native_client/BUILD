@@ -1,9 +1,19 @@
 # Description: Coqui STT native client library.
 
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 load("@org_tensorflow//tensorflow:tensorflow.bzl", "lrt_if_needed")
 load("@com_github_nelhage_rules_boost//:boost/boost.bzl", "boost_deps")
 load("@build_bazel_rules_apple//apple:ios.bzl", "ios_static_framework")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_c_module", "swift_library")
+load("@emsdk//emscripten_toolchain:wasm_rules.bzl", "wasm_cc_binary")
+
+
+# Only required until https://github.com/emscripten-core/emsdk/pull/1060
+# gets merged. Once that's done, we could use "@platform//cpu:wasm32".
+config_setting(
+    name = "wasm_cpu",
+    values = {"cpu": "wasm"},
+)
 
 
 genrule(
@@ -113,7 +123,13 @@ cc_library(
         "kenlm/lm/*.hh",
         "kenlm/util/*.hh",
     ]),
-    deps = [":kenlm_import"],
+    deps = select({
+        # This needs to be linked statically when using WASM/Emscripten.
+        # This has licensing implications since KenLM is LGPL.
+        ":wasm_cpu": [":kenlm_static"],
+        # If not using emscripten, use dynamic linking.
+        "//conditions:default": [":kenlm_import"],
+    }),
     copts = ["-std=c++14"],
     defines = ["KENLM_MAX_ORDER=6"],
     includes = [".", "kenlm"],
@@ -210,8 +226,9 @@ cc_library(
     includes = DECODER_INCLUDES,
     deps = [
         ":decoder",
-        "//tensorflow/lite:framework_stable",
+        "//tensorflow/lite:framework_experimental",
         "//tensorflow/lite/kernels:builtin_ops",
+        "//tensorflow/lite/tools/delegates:delegate_provider_lib",
         "//tensorflow/lite/tools/evaluation:utils",
     ],
 )
@@ -334,4 +351,58 @@ cc_binary(
         "//conditions:default": ["-std=c++14"],
     }),
     linkopts = DECODER_LINKOPTS,
+)
+
+DECODER_LINKOPTS_WASM = DECODER_LINKOPTS + [
+    "-Os",
+    "--bind",
+    "-sWASM=1",
+    # Allow to grow memory allocation when needed (for example for loading models).
+    "-sALLOW_MEMORY_GROWTH",
+    "-sMAXIMUM_MEMORY=4GB",
+    "-sMALLOC=emmalloc",
+    "-sMODULARIZE=1",
+    "-sEXPORT_NAME=STT",
+    # We need to specify a threadpool size, otherwise TFLite will just do nothing
+    # and deadlock.
+    "-sPTHREAD_POOL_SIZE=4",
+    # This is a library, so no 'main' is expected.
+    "--no-entry",
+    # Experiencing problems? Uncomment the flags below to have better
+    # error messages and sanity checks.
+    # "-sASSERTIONS=2",
+    # "-g3",
+    # "-gsource-map",
+]
+
+string_flag(name = "wasm_emit", build_setting_default = "wasm_es5")
+
+config_setting(
+    name = "wasm_es6",
+    flag_values = {
+        ":wasm_emit": "es6",
+    }
+)
+
+cc_binary(
+    # Note that the .js suffix is significant here. See the `-o`
+    # option at https://emscripten.org/docs/tools_reference/emcc.html
+    name = "stt_wasm.js",
+    srcs = [
+        "wasm/bindings.cc",
+    ],
+    deps = [":decoder", ":coqui_stt_bundle"],
+    copts = ["-std=c++14", "-fno-exceptions", "-fwrapv", "-pthread"],
+    linkopts = select({
+        ":wasm_es6": DECODER_LINKOPTS_WASM + [
+            "-sEXPORT_ES6=1",
+            ],
+        "//conditions:default": DECODER_LINKOPTS_WASM,
+    }),
+)
+
+wasm_cc_binary(
+    name = "stt_wasm_bindings",
+    cc_target = ":stt_wasm.js",
+    simd = True,
 )
